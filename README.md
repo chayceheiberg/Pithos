@@ -183,6 +183,44 @@ foreach (var (key, value) in db.Scan()) { ... }
 
 Deleted keys are excluded from scan results. The scan reflects a consistent point-in-time snapshot across the MemTable and all SSTable levels.
 
+### TTL (Time-To-Live)
+
+Enable per-entry expiry by setting `EnableTtl = true` on `PithosOptions`. Expired entries are hidden at read time and physically removed during compaction.
+
+```csharp
+using var db = new PithosDb("path/to/data-directory", new PithosOptions { EnableTtl = true });
+
+// Expires in 30 seconds
+db.Put(key, value, TimeSpan.FromSeconds(30));
+
+// TTL works in write batches too
+var batch = new WriteBatch()
+    .Put(sessionKey, sessionData, TimeSpan.FromHours(1))
+    .Put(cacheKey,   cachedValue, TimeSpan.FromMinutes(5));
+db.Write(batch);
+```
+
+> `EnableTtl` must be set consistently on every open of the same database. Toggling it on an existing database corrupts reads.
+
+### Compaction Filter
+
+Provide an `ICompactionFilter` to logically delete entries based on key or value. Filtered entries are hidden at read time (no waiting for the next compaction) and physically removed when the relevant SSTables are merged.
+
+```csharp
+public sealed class PrefixFilter : ICompactionFilter
+{
+    public bool ShouldKeep(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        => !key.StartsWith("tmp:"u8);
+}
+
+using var db = new PithosDb("path/to/data-directory", new PithosOptions
+{
+    CompactionFilter = new PrefixFilter(),
+});
+```
+
+The filter receives the decoded user value (TTL header already stripped when `EnableTtl` is `true`). The implementation must be thread-safe.
+
 ### Closing
 
 `PithosDb` implements `IDisposable`. Use a `using` statement or call `Dispose()` explicitly to flush and close the WAL.
@@ -217,6 +255,8 @@ using var db = new PithosDb("path/to/data-directory", new PithosOptions
 | `BlockCacheSizeBytes` | 8 MB | Max bytes for the shared block cache; set to 0 to disable |
 | `BlockCacheKind` | `Lru` | Eviction policy: `Lru` or `S3Fifo` |
 | `Compression` | `None` | Block compression: `None` or `Lz4` |
+| `EnableTtl` | `false` | Enables per-entry TTL. Must be set consistently on every open of the same database |
+| `CompactionFilter` | `null` | Optional `ICompactionFilter` applied at read time and compaction |
 
 ---
 
@@ -324,3 +364,22 @@ dotnet test
 ```
 
 Requires .NET 9 SDK.
+
+---
+
+## Contributing
+
+### CI
+
+Every push and pull request runs the full build and test suite via GitHub Actions ([`.github/workflows/ci.yml`](.github/workflows/ci.yml)). All tests must pass before merging.
+
+### Releasing
+
+Releases are published to [NuGet.org](https://www.nuget.org) automatically when a version tag is pushed:
+
+```bash
+git tag v1.4.0
+git push origin v1.4.0
+```
+
+The publish workflow ([`.github/workflows/publish.yml`](.github/workflows/publish.yml)) runs the test suite, packs both `PithosDB` and `PithosDB.Shell` at the tagged version, pushes to NuGet.org, and creates a GitHub Release with auto-generated notes. A `NUGET_API_KEY` secret must be configured under **repo → Settings → Secrets and variables → Actions**.
