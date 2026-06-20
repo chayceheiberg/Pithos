@@ -22,7 +22,9 @@ All public operations are **thread-safe**. Concurrent reads proceed in parallel 
 An in-memory `SortedDictionary<byte[], byte[]?>` that holds the most recent writes. Deleted keys are represented as tombstones (`null` values). When the MemTable exceeds the configured size threshold (default **4 MB**), it is flushed to an L0 SSTable on disk.
 
 #### Write-Ahead Log (`Core/WriteAheadLog.cs`)
-An append-only binary log written to `wal.log` in the database directory. Every `Put` and `Delete` is durably fsynced here before being applied to the MemTable. On startup, the WAL is replayed to restore any unflushed writes. The log is deleted and recreated after each successful flush.
+An append-only binary log written to `wal.log` in the database directory. Every `Put`, `Delete`, and `WriteBatch` is durably fsynced here before being applied to the MemTable. On startup, the WAL is replayed to restore any unflushed writes. The log is deleted and recreated after each successful flush.
+
+Batch entries are written as a single CRC32-guarded record — either the entire batch survives a crash or none of it does. A truncated or corrupt batch record causes replay to stop at that point, so partially-written batches are silently discarded.
 
 #### SSTable (`Storage/SSTableWriter.cs`, `Storage/SSTableReader.cs`)
 Immutable, sorted files written when the MemTable is flushed. Each file has the following layout:
@@ -30,6 +32,7 @@ Immutable, sorted files written when the MemTable is flushed. Each file has the 
 ```
 ┌─────────────────────────────────┐
 │  Data blocks (4 KB each)        │  ← key-value entries, sorted
+│    └── CRC32 checksum (4 bytes) │  ← per-block integrity check
 ├─────────────────────────────────┤
 │  Bloom filter                   │  ← MurmurHash3, configurable FPR (default 1%)
 ├─────────────────────────────────┤
@@ -39,10 +42,17 @@ Immutable, sorted files written when the MemTable is flushed. Each file has the 
 └─────────────────────────────────┘
 ```
 
+Each data block ends with a CRC32 checksum (`System.IO.Hashing.Crc32`). The checksum is verified on every block read; a mismatch throws `InvalidDataException` before any data is returned.
+
 Point lookups consult the bloom filter first; a definite miss skips all block I/O for that file. Range scans use the sparse index to seek directly to the first candidate block.
 
 #### Bloom Filter (`Core/BloomFilter.cs`)
 A bit-array bloom filter using double-hashing over MurmurHash3. Built per SSTable with a configurable false positive rate (default **1%**). Serialized into the SSTable file and loaded into memory on open. A definite miss means no disk reads are needed for that file.
+
+#### Block Cache (`Core/BlockCache.cs`)
+An LRU cache of recently-read SSTable blocks, shared across all open `SSTableReader` instances. When a block is read from disk its data (excluding the CRC) is stored in the cache keyed by `(filePath, blockOffset)`. Subsequent lookups for the same block are served entirely from memory. The cache evicts the least-recently-used block when its byte capacity is exceeded. Cache entries for a compacted file are evicted before the file is deleted.
+
+Enabled by default (8 MB). Set `BlockCacheSizeBytes = 0` to disable.
 
 #### Leveled Compactor (`Compaction/LeveledCompactor.cs`)
 Runs a configurable leveled compaction strategy (default **7 levels**, **10× size multiplier**). When a level reaches its file-count limit, all its SSTables are merged into a single SSTable at the next level using a k-way merge (via `PriorityQueue`) that deduplicates keys, keeping the value from the newest source file.
@@ -56,10 +66,12 @@ src/
 └── Pithos.Core/
     ├── PithosDb.cs                  # Public API / orchestration
     ├── PithosOptions.cs             # Runtime configuration
+    ├── WriteBatch.cs                # Atomic multi-key write batch
     ├── Core/
     │   ├── MemTable.cs
     │   ├── WriteAheadLog.cs
     │   ├── BloomFilter.cs
+    │   ├── BlockCache.cs            # LRU block cache
     │   └── ByteArrayComparer.cs
     ├── Storage/
     │   ├── SSTableWriter.cs
@@ -116,6 +128,21 @@ db.Delete(key);
 
 Deletes are tombstoned — the key is logically removed and `TryGet` returns `false`. Tombstones are physically removed during compaction.
 
+### Atomic Write Batches
+
+`WriteBatch` applies multiple puts and deletes atomically. The entire batch is written to the WAL as a single CRC32-guarded record — either all operations are replayed on recovery or none are.
+
+```csharp
+var batch = new WriteBatch()
+    .Put(Encoding.UTF8.GetBytes("user:1"), Encoding.UTF8.GetBytes("alice"))
+    .Put(Encoding.UTF8.GetBytes("user:2"), Encoding.UTF8.GetBytes("bob"))
+    .Delete(Encoding.UTF8.GetBytes("user:0"));
+
+db.Write(batch);
+```
+
+Batches are not limited in size, but large batches delay the next MemTable flush check until after all operations are applied.
+
 ### Range Scanning
 
 `Scan` returns all live entries within an inclusive key range, in sorted order. Either bound can be omitted for an open-ended scan.
@@ -150,11 +177,12 @@ Pass a `PithosOptions` instance to tune the engine at open time. All properties 
 ```csharp
 using var db = new PithosDb("path/to/data-directory", new PithosOptions
 {
-    MemTableSizeThreshold      = 8 * 1024 * 1024, // 8 MB flush threshold
-    BloomFilterFalsePositiveRate = 0.001,          // 0.1% false positive rate
-    LevelCount                 = 5,                // 5 compaction levels
-    LevelZeroFileCountLimit    = 4,                // compact L0 after 4 files
-    LevelSizeMultiplier        = 10,               // each level is 10× the previous
+    MemTableSizeThreshold        = 8 * 1024 * 1024, // 8 MB flush threshold
+    BloomFilterFalsePositiveRate = 0.001,            // 0.1% false positive rate
+    LevelCount                   = 5,                // 5 compaction levels
+    LevelZeroFileCountLimit      = 4,                // compact L0 after 4 files
+    LevelSizeMultiplier          = 10,               // each level is 10× the previous
+    BlockCacheSizeBytes          = 32 * 1024 * 1024, // 32 MB block cache
 });
 ```
 
@@ -165,6 +193,7 @@ using var db = new PithosDb("path/to/data-directory", new PithosOptions
 | `LevelCount` | 7 | Total number of compaction levels |
 | `LevelZeroFileCountLimit` | 10 | L0 file count that triggers compaction |
 | `LevelSizeMultiplier` | 10 | File-count limit multiplier per level |
+| `BlockCacheSizeBytes` | 8 MB | Max bytes for the shared LRU block cache; set to 0 to disable |
 
 ---
 
