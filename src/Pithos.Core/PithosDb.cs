@@ -18,6 +18,7 @@ public sealed class PithosDb : IDisposable
     private readonly PithosOptions _options;
     private readonly LeveledCompactor _compactor;
     private readonly List<List<string>> _levels = [];
+    private readonly Dictionary<string, SSTableReader> _readerCache = new();
     private readonly ReaderWriterLockSlim _lock = new();
 
     private MemTable _memTable = new();
@@ -38,7 +39,7 @@ public sealed class PithosDb : IDisposable
         _options.Validate();
         _directory = directory;
         Directory.CreateDirectory(directory);
-        _compactor = new LeveledCompactor(directory, _options);
+        _compactor = new LeveledCompactor(directory, _options, _readerCache);
         _wal = new WriteAheadLog(Path.Combine(directory, "wal.log"));
         RecoverFromWal();
         RecoverSSTables();
@@ -112,8 +113,7 @@ public sealed class PithosDb : IDisposable
             {
                 foreach (var sstPath in Enumerable.Reverse(level))
                 {
-                    using var reader = new SSTableReader(sstPath);
-                    if (reader.TryGet(key, out value))
+                    if (_readerCache[sstPath].TryGet(key, out value))
                         return value is not null;
                 }
             }
@@ -136,6 +136,7 @@ public sealed class PithosDb : IDisposable
         string sstPath = Path.Combine(_directory, $"L0_{Guid.NewGuid():N}.sst");
         SSTableWriter.Write(sstPath, _memTable.GetSortedEntries(), _options.BloomFilterFalsePositiveRate);
         _levels[0].Add(sstPath);
+        _readerCache[sstPath] = new SSTableReader(sstPath);
         _memTable.Clear();
 
         _wal.Dispose();
@@ -165,13 +166,17 @@ public sealed class PithosDb : IDisposable
 
             while (_levels.Count <= level) _levels.Add([]);
             _levels[level].Add(path);
+            _readerCache[path] = new SSTableReader(path);
         }
     }
 
-    /// <summary>Flushes and closes the WAL, then disposes the lock.</summary>
+    /// <summary>Flushes and closes the WAL, disposes all cached SSTable readers, then disposes the lock.</summary>
     public void Dispose()
     {
         _wal.Dispose();
+        foreach (var reader in _readerCache.Values)
+            reader.Dispose();
+        _readerCache.Clear();
         _lock.Dispose();
     }
 }

@@ -1,3 +1,6 @@
+using System.Buffers;
+using System.Buffers.Binary;
+using Microsoft.Win32.SafeHandles;
 using Pithos.Core.Core;
 
 namespace Pithos.Core.Storage;
@@ -37,6 +40,12 @@ public sealed class SSTableReader : IDisposable
     /// any block I/O. Returns <see langword="true"/> for tombstones (with a
     /// <see langword="null"/> <paramref name="value"/>), allowing callers to
     /// distinguish "found a tombstone" from "not present".
+    /// <para>
+    /// Thread-safe: the bloom filter and index are pure in-memory reads; the block
+    /// is fetched with a single positional <see cref="RandomAccess.Read"/> call
+    /// (does not advance <c>_stream.Position</c>) and parsed entirely in memory,
+    /// so concurrent callers never share mutable state.
+    /// </para>
     /// </summary>
     /// <param name="key">The key to look up.</param>
     /// <param name="value">
@@ -48,29 +57,75 @@ public sealed class SSTableReader : IDisposable
         value = null;
         if (!_bloom.MightContain(key)) return false;
 
-        var blockOffset = FindBlockOffset(key);
+        var (blockOffset, blockEnd) = FindBlockBounds(key);
         if (blockOffset < 0) return false;
 
-        _stream.Seek(blockOffset, SeekOrigin.Begin);
-        int count = _reader.ReadInt32();
+        // Read the entire block in one positional I/O call, then parse from
+        // memory. This keeps syscall count at O(1) regardless of how many
+        // entries are scanned (critical for misses that must read the whole block).
+        int blockLen = (int)(blockEnd - blockOffset);
+        byte[] buf = ArrayPool<byte>.Shared.Rent(blockLen);
+        try
+        {
+            ReadAt(_stream.SafeFileHandle, buf.AsSpan(0, blockLen), blockOffset);
+            return ParseBlock(buf.AsSpan(0, blockLen), key, out value);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+        }
+    }
+
+    private static bool ParseBlock(ReadOnlySpan<byte> block, byte[] key, out byte[]? value)
+    {
+        value = null;
+        int pos = 0;
+
+        int count = BinaryPrimitives.ReadInt32LittleEndian(block[pos..]);
+        pos += 4;
 
         for (int i = 0; i < count; i++)
         {
-            var keyLen = _reader.ReadInt32();
-            var entryKey = _reader.ReadBytes(keyLen);
-            var isTombstone = _reader.ReadBoolean();
-            byte[]? entryValue = null;
+            int keyLen = BinaryPrimitives.ReadInt32LittleEndian(block[pos..]);
+            pos += 4;
+
+            ReadOnlySpan<byte> entryKey = block.Slice(pos, keyLen);
+            pos += keyLen;
+
+            bool isTombstone = block[pos] != 0;
+            pos += 1;
+
+            int cmp = entryKey.SequenceCompareTo(key.AsSpan());
+
             if (!isTombstone)
             {
-                var valLen = _reader.ReadInt32();
-                entryValue = _reader.ReadBytes(valLen);
-            }
+                int valLen = BinaryPrimitives.ReadInt32LittleEndian(block[pos..]);
+                pos += 4;
 
-            int cmp = ByteArrayComparer.Instance.Compare(entryKey, key);
-            if (cmp == 0) { value = entryValue; return true; }
-            if (cmp > 0) return false;
+                if (cmp == 0) { value = block.Slice(pos, valLen).ToArray(); return true; }
+                if (cmp > 0) return false;
+                pos += valLen;
+            }
+            else
+            {
+                if (cmp == 0) return true;
+                if (cmp > 0) return false;
+            }
         }
         return false;
+    }
+
+    // Positional read that retries until the buffer is full. RandomAccess.Read
+    // does not advance _stream.Position, so concurrent callers share the handle safely.
+    private static void ReadAt(SafeFileHandle handle, Span<byte> buffer, long offset)
+    {
+        while (!buffer.IsEmpty)
+        {
+            int n = RandomAccess.Read(handle, buffer, offset);
+            if (n == 0) throw new EndOfStreamException();
+            buffer = buffer[n..];
+            offset += n;
+        }
     }
 
     /// <summary>
@@ -104,9 +159,12 @@ public sealed class SSTableReader : IDisposable
 
     /// <summary>
     /// Binary-searches the sparse index for the last block whose first key is
-    /// ≤ <paramref name="key"/>. Returns -1 if the key precedes the first block.
+    /// ≤ <paramref name="key"/>. Returns <c>(-1, -1)</c> if the key precedes the
+    /// first block. The <c>end</c> value is the exclusive byte offset of the block's
+    /// last byte — either the next block's start or <c>_bloomOffset</c> for the
+    /// last block.
     /// </summary>
-    private long FindBlockOffset(byte[] key)
+    private (long start, long end) FindBlockBounds(byte[] key)
     {
         int lo = 0, hi = _index.Count - 1, result = -1;
         while (lo <= hi)
@@ -116,7 +174,10 @@ public sealed class SSTableReader : IDisposable
             if (cmp <= 0) { result = mid; lo = mid + 1; }
             else hi = mid - 1;
         }
-        return result < 0 ? -1 : _index[result].offset;
+        if (result < 0) return (-1L, -1L);
+        long start = _index[result].offset;
+        long end = result + 1 < _index.Count ? _index[result + 1].offset : _bloomOffset;
+        return (start, end);
     }
 
     /// <summary>
