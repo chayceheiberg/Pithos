@@ -15,6 +15,7 @@ public sealed class LeveledCompactor
     private readonly PithosOptions _options;
     private readonly int[] _levelSizeLimits;
     private readonly Dictionary<string, SSTableReader> _readerCache;
+    private readonly BlockCache? _blockCache;
 
     /// <summary>
     /// Creates a compactor for the database at <paramref name="directory"/> using
@@ -27,11 +28,12 @@ public sealed class LeveledCompactor
     /// source-file entries before deleting them and registers the merged output
     /// so reads can immediately use the cached reader.
     /// </param>
-    public LeveledCompactor(string directory, PithosOptions options, Dictionary<string, SSTableReader> readerCache)
+    public LeveledCompactor(string directory, PithosOptions options, Dictionary<string, SSTableReader> readerCache, BlockCache? blockCache = null)
     {
         _directory = directory;
         _options = options;
         _readerCache = readerCache;
+        _blockCache = blockCache;
         _levelSizeLimits = new int[options.LevelCount];
         int size = options.LevelZeroFileCountLimit;
         for (int i = 0; i < options.LevelCount; i++) { _levelSizeLimits[i] = size; size *= options.LevelSizeMultiplier; }
@@ -70,13 +72,14 @@ public sealed class LeveledCompactor
             string outPath = System.IO.Path.Combine(_directory, $"L{level + 1}_{Guid.NewGuid():N}.sst");
             SSTableWriter.Write(outPath, merged, _options.BloomFilterFalsePositiveRate);
             levels[level + 1].Add(outPath);
-            _readerCache[outPath] = new SSTableReader(outPath);
+            _readerCache[outPath] = new SSTableReader(outPath, _blockCache);
         }
         finally
         {
             foreach (var r in readers) r.Dispose();
             foreach (var p in sources)
             {
+                _blockCache?.EvictFile(p);
                 if (_readerCache.TryGetValue(p, out var cached))
                 {
                     _readerCache.Remove(p);

@@ -38,6 +38,13 @@ public sealed class PithosOptions
     /// </summary>
     public int LevelSizeMultiplier { get; init; } = 10;
 
+    /// <summary>
+    /// Maximum number of bytes the shared block cache may hold. Frequently-read
+    /// SSTable blocks are kept in memory and served without disk I/O until evicted
+    /// by the LRU policy. Set to 0 to disable the block cache. Default: 8 MB.
+    /// </summary>
+    public long BlockCacheSizeBytes { get; init; } = 8 * 1024 * 1024;
+
     /// <summary>Default options — equivalent to <c>new PithosOptions()</c>.</summary>
     public static readonly PithosOptions Default = new();
 
@@ -61,5 +68,8 @@ public sealed class PithosOptions
 
         if (LevelSizeMultiplier < 2)
             throw new ArgumentOutOfRangeException(nameof(LevelSizeMultiplier), "Must be at least 2.");
+
+        if (BlockCacheSizeBytes < 0)
+            throw new ArgumentOutOfRangeException(nameof(BlockCacheSizeBytes), "Must be zero or greater.");
     }
 }

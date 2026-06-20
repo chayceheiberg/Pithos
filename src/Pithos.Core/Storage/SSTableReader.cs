@@ -18,6 +18,7 @@ public sealed class SSTableReader : IDisposable
     private readonly List<(byte[] firstKey, long offset)> _index;
     private readonly BloomFilter _bloom;
     private readonly long _bloomOffset;
+    private readonly BlockCache? _blockCache;
 
     /// <summary>Absolute path to the SSTable file.</summary>
     public string Path { get; }
@@ -26,9 +27,15 @@ public sealed class SSTableReader : IDisposable
     /// Opens the SSTable at <paramref name="path"/> and loads its index and
     /// bloom filter into memory.
     /// </summary>
-    public SSTableReader(string path)
+    /// <param name="path">Absolute path to the SSTable file.</param>
+    /// <param name="blockCache">
+    /// Optional shared block cache. When provided, block reads are served from
+    /// cache on subsequent accesses to the same block.
+    /// </param>
+    public SSTableReader(string path, BlockCache? blockCache = null)
     {
         Path = path;
+        _blockCache = blockCache;
         _stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read);
         _reader = new BinaryReader(_stream);
         (_index, _bloom, _bloomOffset) = ReadMetadata();
@@ -60,14 +67,27 @@ public sealed class SSTableReader : IDisposable
         var (blockOffset, blockEnd) = FindBlockBounds(key);
         if (blockOffset < 0) return false;
 
-        // Read the entire block in one positional I/O call, then parse from
-        // memory. This keeps syscall count at O(1) regardless of how many
-        // entries are scanned (critical for misses that must read the whole block).
         int blockLen = (int)(blockEnd - blockOffset);
+
+        // Cache hit — no I/O needed.
+        if (_blockCache is not null && _blockCache.TryGet(Path, blockOffset, out var cached))
+            return ParseBlock(cached, key, out value);
+
+        // Cache miss — read the entire block in one positional I/O call, store a
+        // heap copy in the cache, then parse from memory. O(1) syscalls regardless
+        // of how many entries must be scanned.
         byte[] buf = ArrayPool<byte>.Shared.Rent(blockLen);
         try
         {
             ReadAt(_stream.SafeFileHandle, buf.AsSpan(0, blockLen), blockOffset);
+
+            if (_blockCache is not null)
+            {
+                var blockCopy = buf.AsSpan(0, blockLen).ToArray();
+                _blockCache.Put(Path, blockOffset, blockCopy);
+                return ParseBlock(blockCopy, key, out value);
+            }
+
             return ParseBlock(buf.AsSpan(0, blockLen), key, out value);
         }
         finally
