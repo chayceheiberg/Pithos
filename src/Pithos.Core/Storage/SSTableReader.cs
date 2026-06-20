@@ -1,3 +1,5 @@
+using System.Buffers.Binary;
+using Microsoft.Win32.SafeHandles;
 using Pithos.Core.Core;
 
 namespace Pithos.Core.Storage;
@@ -56,23 +58,42 @@ public sealed class SSTableReader : IDisposable
         var blockOffset = FindBlockOffset(key);
         if (blockOffset < 0) return false;
 
-        // Open a per-call stream so this method is thread-safe when the reader
-        // is shared across concurrent callers from the SSTableReader cache.
-        using var stream = new FileStream(Path, FileMode.Open, FileAccess.Read, FileShare.Read);
-        using var reader = new BinaryReader(stream);
-        stream.Seek(blockOffset, SeekOrigin.Begin);
-        int count = reader.ReadInt32();
+        // RandomAccess.Read performs positional I/O that does not advance the
+        // stream's seek pointer, so multiple concurrent callers can safely share
+        // the same open handle without coordination.
+        var handle = _stream.SafeFileHandle;
+        long pos = blockOffset;
+        Span<byte> int32Buf = stackalloc byte[4];
+        Span<byte> boolBuf  = stackalloc byte[1];
+
+        ReadAt(handle, int32Buf, pos);
+        int count = BinaryPrimitives.ReadInt32LittleEndian(int32Buf);
+        pos += 4;
 
         for (int i = 0; i < count; i++)
         {
-            var keyLen = reader.ReadInt32();
-            var entryKey = reader.ReadBytes(keyLen);
-            var isTombstone = reader.ReadBoolean();
+            ReadAt(handle, int32Buf, pos);
+            int keyLen = BinaryPrimitives.ReadInt32LittleEndian(int32Buf);
+            pos += 4;
+
+            var entryKey = new byte[keyLen];
+            ReadAt(handle, entryKey, pos);
+            pos += keyLen;
+
+            ReadAt(handle, boolBuf, pos);
+            bool isTombstone = boolBuf[0] != 0;
+            pos += 1;
+
             byte[]? entryValue = null;
             if (!isTombstone)
             {
-                var valLen = reader.ReadInt32();
-                entryValue = reader.ReadBytes(valLen);
+                ReadAt(handle, int32Buf, pos);
+                int valLen = BinaryPrimitives.ReadInt32LittleEndian(int32Buf);
+                pos += 4;
+
+                entryValue = new byte[valLen];
+                ReadAt(handle, entryValue, pos);
+                pos += valLen;
             }
 
             int cmp = ByteArrayComparer.Instance.Compare(entryKey, key);
@@ -80,6 +101,19 @@ public sealed class SSTableReader : IDisposable
             if (cmp > 0) return false;
         }
         return false;
+    }
+
+    // Positional read that retries until the buffer is full (RandomAccess.Read
+    // may return fewer bytes than requested on a single call).
+    private static void ReadAt(SafeFileHandle handle, Span<byte> buffer, long offset)
+    {
+        while (!buffer.IsEmpty)
+        {
+            int n = RandomAccess.Read(handle, buffer, offset);
+            if (n == 0) throw new EndOfStreamException();
+            buffer = buffer[n..];
+            offset += n;
+        }
     }
 
     /// <summary>
