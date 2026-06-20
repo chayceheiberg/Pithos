@@ -1,8 +1,8 @@
-<p align="center">
+﻿<p align="center">
   <img src="pithos-logo.svg" alt="Pithos" width="160" />
 </p>
 
-# Pithos
+# PithosDB
 
 A persistent, embedded key-value storage engine built on an [LSM-tree](https://en.wikipedia.org/wiki/Log-structured_merge-tree) (Log-Structured Merge-Tree) architecture. Written in C# targeting .NET 9.
 
@@ -80,7 +80,7 @@ Runs a configurable leveled compaction strategy (default **7 levels**, **10× si
 
 ```
 src/
-└── Pithos.Core/
+└── PithosDB.Core/
     ├── PithosDb.cs                  # Public API / orchestration
     ├── PithosOptions.cs             # Runtime configuration (CompressionKind, BlockCacheKind)
     ├── WriteBatch.cs                # Atomic multi-key write batch
@@ -98,9 +98,9 @@ src/
     └── Compaction/
         └── LeveledCompactor.cs
 tests/
-└── Pithos.Tests/                    # xUnit test project
+└── PithosDB.Tests/                    # xUnit test project
 benchmarks/
-└── Pithos.Benchmarks/               # BenchmarkDotNet performance tests
+└── PithosDB.Benchmarks/               # BenchmarkDotNet performance tests
 ```
 
 ---
@@ -110,7 +110,7 @@ benchmarks/
 ### Opening a Database
 
 ```csharp
-using Pithos.Core;
+using PithosDB.Core;
 
 using var db = new PithosDb("path/to/data-directory");
 ```
@@ -298,13 +298,13 @@ At small data sizes the compaction overhead is modest — merging a few kilobyte
 ### Running Benchmarks
 
 ```bash
-dotnet run -c Release --project benchmarks/Pithos.Benchmarks
+dotnet run -c Release --project benchmarks/PithosDB.Benchmarks
 ```
 
 To target a specific class:
 
 ```bash
-dotnet run -c Release --project benchmarks/Pithos.Benchmarks -- --filter "*ReadBenchmarks*"
+dotnet run -c Release --project benchmarks/PithosDB.Benchmarks -- --filter "*ReadBenchmarks*"
 ```
 
 Benchmarks must be run in Release mode. BenchmarkDotNet will error if invoked under Debug.
