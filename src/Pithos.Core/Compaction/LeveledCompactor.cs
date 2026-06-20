@@ -14,6 +14,7 @@ public sealed class LeveledCompactor
     private readonly string _directory;
     private readonly PithosOptions _options;
     private readonly int[] _levelSizeLimits;
+    private readonly Dictionary<string, SSTableReader> _readerCache;
 
     /// <summary>
     /// Creates a compactor for the database at <paramref name="directory"/> using
@@ -21,10 +22,16 @@ public sealed class LeveledCompactor
     /// </summary>
     /// <param name="directory">Database directory where SSTable files are written.</param>
     /// <param name="options">Options governing level count, size limits, and bloom filter FPR.</param>
-    public LeveledCompactor(string directory, PithosOptions options)
+    /// <param name="readerCache">
+    /// Shared SSTableReader cache owned by the database. The compactor evicts
+    /// source-file entries before deleting them and registers the merged output
+    /// so reads can immediately use the cached reader.
+    /// </param>
+    public LeveledCompactor(string directory, PithosOptions options, Dictionary<string, SSTableReader> readerCache)
     {
         _directory = directory;
         _options = options;
+        _readerCache = readerCache;
         _levelSizeLimits = new int[options.LevelCount];
         int size = options.LevelZeroFileCountLimit;
         for (int i = 0; i < options.LevelCount; i++) { _levelSizeLimits[i] = size; size *= options.LevelSizeMultiplier; }
@@ -63,11 +70,20 @@ public sealed class LeveledCompactor
             string outPath = System.IO.Path.Combine(_directory, $"L{level + 1}_{Guid.NewGuid():N}.sst");
             SSTableWriter.Write(outPath, merged, _options.BloomFilterFalsePositiveRate);
             levels[level + 1].Add(outPath);
+            _readerCache[outPath] = new SSTableReader(outPath);
         }
         finally
         {
             foreach (var r in readers) r.Dispose();
-            foreach (var p in sources) File.Delete(p);
+            foreach (var p in sources)
+            {
+                if (_readerCache.TryGetValue(p, out var cached))
+                {
+                    _readerCache.Remove(p);
+                    cached.Dispose();
+                }
+                File.Delete(p);
+            }
         }
     }
 

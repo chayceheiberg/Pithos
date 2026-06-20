@@ -37,6 +37,11 @@ public sealed class SSTableReader : IDisposable
     /// any block I/O. Returns <see langword="true"/> for tombstones (with a
     /// <see langword="null"/> <paramref name="value"/>), allowing callers to
     /// distinguish "found a tombstone" from "not present".
+    /// <para>
+    /// Thread-safe: the bloom filter and index are consulted from the cached
+    /// in-memory structures; only the block read opens a short-lived
+    /// <see cref="FileStream"/> so concurrent callers never share mutable state.
+    /// </para>
     /// </summary>
     /// <param name="key">The key to look up.</param>
     /// <param name="value">
@@ -51,19 +56,23 @@ public sealed class SSTableReader : IDisposable
         var blockOffset = FindBlockOffset(key);
         if (blockOffset < 0) return false;
 
-        _stream.Seek(blockOffset, SeekOrigin.Begin);
-        int count = _reader.ReadInt32();
+        // Open a per-call stream so this method is thread-safe when the reader
+        // is shared across concurrent callers from the SSTableReader cache.
+        using var stream = new FileStream(Path, FileMode.Open, FileAccess.Read, FileShare.Read);
+        using var reader = new BinaryReader(stream);
+        stream.Seek(blockOffset, SeekOrigin.Begin);
+        int count = reader.ReadInt32();
 
         for (int i = 0; i < count; i++)
         {
-            var keyLen = _reader.ReadInt32();
-            var entryKey = _reader.ReadBytes(keyLen);
-            var isTombstone = _reader.ReadBoolean();
+            var keyLen = reader.ReadInt32();
+            var entryKey = reader.ReadBytes(keyLen);
+            var isTombstone = reader.ReadBoolean();
             byte[]? entryValue = null;
             if (!isTombstone)
             {
-                var valLen = _reader.ReadInt32();
-                entryValue = _reader.ReadBytes(valLen);
+                var valLen = reader.ReadInt32();
+                entryValue = reader.ReadBytes(valLen);
             }
 
             int cmp = ByteArrayComparer.Instance.Compare(entryKey, key);
