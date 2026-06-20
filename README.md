@@ -187,13 +187,13 @@ Sequential and random key patterns perform nearly identically — `SortedDiction
 
 | Method | Mean | Allocated |
 |---|---|---|
-| `MemTableHit` | 20.3 ns | 0 B |
-| `SSTableHit` | 59.3 µs | 6.5 KB |
-| `KeyMiss` | 62.0 µs | 10.4 KB |
+| `MemTableHit` | 21.1 ns | 0 B |
+| `SSTableHit` | 3.0 µs | 2.1 KB |
+| `KeyMiss` | 3.3 µs | 2.1 KB |
 
-A MemTable hit costs **~20 ns** with zero allocation. An SSTable hit costs **~59 µs** — the bloom filter and sparse index are loaded once per file at open time and kept in memory; each lookup opens a short-lived `FileStream` only to read the single matching data block. A key miss is similar: the bloom filter rejects the key without a block read, but a `FileStream` is still opened per file to perform the bloom check against the in-memory filter (the open is needed to ensure the file is accessible; the check itself is pure memory).
+A MemTable hit costs **~21 ns** with zero allocation. An SSTable hit and a key miss both cost **~3 µs** — the bloom filter and sparse index are loaded once per file at open time and kept in memory; the only I/O per lookup is a single positional `RandomAccess.Read` call that fetches the relevant 4 KB data block directly through the cached file handle. The block is parsed entirely from memory, so the cost is one syscall regardless of how many entries must be scanned. A miss costs only 10% more than a hit because the bloom filter (1% FPR) occasionally passes through a false positive that requires reading a block.
 
-> **Before caching (baseline):** `SSTableHit` cost ~2 ms and allocated ~151 KB per call because a new `SSTableReader` — including full bloom filter and index I/O — was opened and closed on every lookup. Caching reduced latency **34×** and allocations **23×**.
+> **Optimization history:** the baseline opened and closed a full `SSTableReader` (bloom filter + index I/O) on every `TryGet` call — **~2 ms, 151 KB**. Three incremental improvements reduced this to the current numbers: (1) caching reader instances so bloom and index are always in memory, (2) replacing per-call `FileStream` opens with positional `RandomAccess` reads on a persistent handle, and (3) pre-reading the full block in one syscall before parsing, eliminating per-field I/O overhead on block scans. Net result: **667× faster, 72× fewer allocations**.
 
 ### Concurrency (500 ops per task)
 
