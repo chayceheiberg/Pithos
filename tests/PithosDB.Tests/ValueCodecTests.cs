@@ -59,7 +59,7 @@ public class ValueCodecTests
     {
         var encoded = ValueCodec.Encode([]);
         var decoded = ValueCodec.Decode(encoded);
-        Assert.Equal([], decoded);
+        Assert.Equal([], decoded!);
     }
 
     [Fact]
@@ -81,7 +81,7 @@ public class ValueCodecTests
     public void Decode_EmptyStored_ReturnsEmpty()
     {
         // Zero-length stored value is a special edge case: returned as-is.
-        Assert.Equal([], ValueCodec.Decode([]));
+        Assert.Equal([], ValueCodec.Decode([])!);
     }
 
     [Fact]
@@ -124,7 +124,7 @@ public class ValueCodecTests
     public void DecodeForCompaction_EmptyStored_ReturnsEmpty()
     {
         var (value, dropped) = ValueCodec.DecodeForCompaction([]);
-        Assert.Equal([], value);
+        Assert.Equal([], value!);
         Assert.False(dropped);
     }
 
