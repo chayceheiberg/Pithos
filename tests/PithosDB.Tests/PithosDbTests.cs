@@ -142,4 +142,89 @@ public class PithosDbTests : IDisposable
             Assert.Equal(value, result);
         }
     }
+
+    // ── WriteBatch TTL guard ───────────────────────────────────────────────────
+
+    [Fact]
+    public void Write_BatchWithTtlEntry_Throws_WhenEnableTtlFalse()
+    {
+        using var db = new PithosDb(_dir); // EnableTtl=false by default
+        var batch = new WriteBatch().Put(K("k"), V("v"), TimeSpan.FromSeconds(10));
+        Assert.Throws<InvalidOperationException>(() => db.Write(batch));
+    }
+
+    // ── Scan across MemTable + SSTables (k-way merge) ─────────────────────────
+    //
+    // With only MemTable data, CollectScan uses a single source and the PQ
+    // comparator lambda never fires (heap of one item needs no comparison).
+    // Flushing to an SSTable before scanning exercises:
+    //   • the SSTable source loop in CollectScan (lines 243-244)
+    //   • the PQ comparator body (lines 249-250)
+    // Overwriting a key after flush ensures the same key appears in both
+    // MemTable and SSTable, triggering the tie-breaker branch (line 250).
+
+    [Fact]
+    public void Scan_ReturnsEntries_FromSSTables()
+    {
+        var opts = new PithosOptions { MemTableSizeThreshold = 256 };
+        using var db = new PithosDb(_dir, opts);
+
+        db.Put(K("a"), new byte[128]);
+        db.Put(K("b"), new byte[128]);
+        db.Put(K("c"), new byte[128]); // triggers flush to SSTable
+
+        var keys = db.Scan().Select(e => e.key).ToList();
+        Assert.Contains(K("a"), keys);
+        Assert.Contains(K("b"), keys);
+        Assert.Contains(K("c"), keys);
+    }
+
+    [Fact]
+    public void Scan_DeduplicatesKey_WhenPresentInBothMemTableAndSSTable()
+    {
+        var opts = new PithosOptions { MemTableSizeThreshold = 256 };
+        using var db = new PithosDb(_dir, opts);
+
+        // Flush "a" and "b" to an SSTable.
+        db.Put(K("a"), new byte[128]);
+        db.Put(K("b"), new byte[128]);
+        db.Put(K("c"), new byte[128]); // triggers flush
+
+        // Overwrite "a" — now in both SSTable (old) and MemTable (new).
+        db.Put(K("a"), V("updated"));
+
+        var results = db.Scan().ToList();
+
+        // "a" must appear exactly once with the newest value.
+        var aEntries = results.Where(e => e.key.SequenceEqual(K("a"))).ToList();
+        Assert.Single(aEntries);
+        Assert.Equal(V("updated"), aEntries[0].value);
+    }
+
+    // ── No-manifest SSTable recovery ──────────────────────────────────────────
+    //
+    // When a MANIFEST file is absent, RecoverSSTables falls back to scanning
+    // the directory for *.sst files. Exercised by deleting the manifest between
+    // two opens.
+
+    [Fact]
+    public void RecoverSSTables_WithoutManifest_RecoversByDirectoryScan()
+    {
+        var opts = new PithosOptions { MemTableSizeThreshold = 256 };
+
+        using (var db = new PithosDb(_dir, opts))
+        {
+            db.Put(K("x"), new byte[128]);
+            db.Put(K("y"), new byte[128]);
+            db.Put(K("z"), new byte[128]); // triggers flush + manifest write
+        }
+
+        // Remove the manifest to force the fallback recovery path.
+        File.Delete(Path.Combine(_dir, "MANIFEST"));
+
+        using var db2 = new PithosDb(_dir, opts);
+        Assert.True(db2.TryGet(K("x"), out _));
+        Assert.True(db2.TryGet(K("y"), out _));
+        Assert.True(db2.TryGet(K("z"), out _));
+    }
 }
