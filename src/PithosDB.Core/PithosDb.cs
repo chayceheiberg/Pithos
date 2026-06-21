@@ -202,6 +202,66 @@ public sealed class PithosDb : IDisposable
     }
 
     /// <summary>
+    /// Atomically reads <paramref name="key"/> and, if its current value equals
+    /// <paramref name="expectedValue"/>, replaces it with <paramref name="newValue"/>.
+    /// Returns <see langword="true"/> when the swap was applied, <see langword="false"/>
+    /// when the current value did not match and no write was performed.
+    /// <para>
+    /// Pass <see langword="null"/> for <paramref name="expectedValue"/> to match a key
+    /// that does not exist or has been deleted — useful for "insert if absent" semantics.
+    /// </para>
+    /// <para>
+    /// The read and the conditional write are performed under a single write lock, so no
+    /// concurrent writer can observe an intermediate state.
+    /// </para>
+    /// </summary>
+    public bool CompareAndSwap(byte[] key, byte[]? expectedValue, byte[] newValue)
+    {
+        _lock.EnterWriteLock();
+        try
+        {
+            var current = ReadCurrentValue(key);
+            if (!BytesEqual(current, expectedValue)) return false;
+
+            var stored = _options.EnableTtl ? ValueCodec.Encode(newValue) : newValue;
+            _wal?.AppendPut(key, stored);
+            _memTable.Put(key, stored);
+            MaybeFlushMemTable();
+            return true;
+        }
+        finally { _lock.ExitWriteLock(); }
+    }
+
+    // Reads the decoded user value for 'key' without acquiring any lock.
+    // Must only be called while the caller already holds _lock (read or write).
+    private byte[]? ReadCurrentValue(byte[] key)
+    {
+        byte[]? raw;
+        if (_memTable.TryGet(key, out raw))
+        {
+            if (raw is null) return null; // tombstone
+            return DecodeAndFilter(key, raw, out var v) ? v : null;
+        }
+        foreach (var level in _levels)
+        foreach (var path in Enumerable.Reverse(level))
+        {
+            if (_readerCache[path].TryGet(key, out raw))
+            {
+                if (raw is null) return null; // tombstone
+                return DecodeAndFilter(key, raw, out var v) ? v : null;
+            }
+        }
+        return null;
+    }
+
+    private static bool BytesEqual(byte[]? a, byte[]? b)
+    {
+        if (a is null && b is null) return true;
+        if (a is null || b is null) return false;
+        return a.AsSpan().SequenceEqual(b.AsSpan());
+    }
+
+    /// <summary>
     /// Looks up <paramref name="key"/>, searching the MemTable first, then each
     /// SSTable level from newest to oldest. Returns <see langword="false"/> if
     /// the key does not exist, has been deleted, has expired (TTL), or is filtered
@@ -585,6 +645,14 @@ public sealed class PithosDb : IDisposable
     /// </summary>
     public Task DeleteRangeAsync(byte[]? from = null, byte[]? to = null, CancellationToken cancellationToken = default)
         => Task.Run(() => DeleteRange(from, to), cancellationToken);
+
+    /// <summary>
+    /// Asynchronously performs a compare-and-swap on <paramref name="key"/>.
+    /// Returns <see langword="true"/> when the swap was applied.
+    /// </summary>
+    public Task<bool> CompareAndSwapAsync(byte[] key, byte[]? expectedValue, byte[] newValue,
+        CancellationToken cancellationToken = default)
+        => Task.Run(() => CompareAndSwap(key, expectedValue, newValue), cancellationToken);
 
     /// <summary>
     /// Asynchronously applies all operations in <paramref name="batch"/> atomically.
