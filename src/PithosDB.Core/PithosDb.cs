@@ -25,7 +25,7 @@ public sealed class PithosDb : IDisposable
     private readonly ReaderWriterLockSlim _lock = new();
 
     private MemTable _memTable = new();
-    private WriteAheadLog _wal;
+    private WriteAheadLog? _wal;
 
     /// <summary>
     /// Opens or creates a database in <paramref name="directory"/>. Any unflushed
@@ -41,7 +41,8 @@ public sealed class PithosDb : IDisposable
         _options = options ?? PithosOptions.Default;
         _options.Validate();
         _directory = directory;
-        Directory.CreateDirectory(directory);
+        if (!_options.InMemory)
+            Directory.CreateDirectory(directory);
         _blockCache = _options.BlockCacheSizeBytes > 0
             ? _options.BlockCacheKind == BlockCacheKind.S3Fifo
                 ? new S3FifoBlockCache(_options.BlockCacheSizeBytes)
@@ -49,9 +50,12 @@ public sealed class PithosDb : IDisposable
             : null;
         _manifest = new Manifest(directory);
         _compactor = new LeveledCompactor(directory, _options, _readerCache, _blockCache, _manifest);
-        _wal = new WriteAheadLog(Path.Combine(directory, "wal.log"));
-        RecoverFromWal();
-        RecoverSSTables();
+        if (!_options.InMemory)
+        {
+            _wal = new WriteAheadLog(Path.Combine(directory, "wal.log"));
+            RecoverFromWal();
+            RecoverSSTables();
+        }
     }
 
     /// <summary>
@@ -66,7 +70,7 @@ public sealed class PithosDb : IDisposable
         _lock.EnterWriteLock();
         try
         {
-            _wal.AppendPut(key, stored);
+            _wal?.AppendPut(key, stored);
             _memTable.Put(key, stored);
             MaybeFlushMemTable();
         }
@@ -92,7 +96,7 @@ public sealed class PithosDb : IDisposable
         _lock.EnterWriteLock();
         try
         {
-            _wal.AppendPut(key, stored);
+            _wal?.AppendPut(key, stored);
             _memTable.Put(key, stored);
             MaybeFlushMemTable();
         }
@@ -130,7 +134,7 @@ public sealed class PithosDb : IDisposable
                 })
                 .ToList();
 
-            _wal.AppendBatch(encoded);
+            _wal?.AppendBatch(encoded);
             foreach (var (type, key, value) in encoded)
             {
                 if (type == WalEntryType.Put) _memTable.Put(key, value!);
@@ -152,7 +156,7 @@ public sealed class PithosDb : IDisposable
         _lock.EnterWriteLock();
         try
         {
-            _wal.AppendDelete(key);
+            _wal?.AppendDelete(key);
             _memTable.Delete(key);
             MaybeFlushMemTable();
         }
@@ -307,6 +311,7 @@ public sealed class PithosDb : IDisposable
 
     private void MaybeFlushMemTable()
     {
+        if (_options.InMemory) return;
         if (_memTable.SizeBytes < _options.MemTableSizeThreshold) return;
 
         if (_levels.Count == 0) _levels.Add([]);
@@ -317,7 +322,7 @@ public sealed class PithosDb : IDisposable
         _readerCache[sstPath] = new SSTableReader(sstPath, _blockCache);
         _memTable.Clear();
 
-        _wal.Dispose();
+        _wal!.Dispose();
         File.Delete(Path.Combine(_directory, "wal.log"));
         _wal = new WriteAheadLog(Path.Combine(_directory, "wal.log"));
 
@@ -373,6 +378,28 @@ public sealed class PithosDb : IDisposable
             if (_levels.Count > 0)
                 _manifest.Write(_levels);
         }
+    }
+
+    // ── In-memory factory ─────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Creates an in-memory <see cref="PithosDb"/> that stores no data on disk.
+    /// No directory is required; data is lost when the instance is disposed.
+    /// Useful for unit testing and ephemeral workloads.
+    /// </summary>
+    /// <param name="options">
+    /// Optional tuning options. <see cref="PithosOptions.InMemory"/> is forced to
+    /// <see langword="true"/>; disk-related settings (block cache, compression, etc.)
+    /// are ignored. Pass <see langword="null"/> to use defaults.
+    /// </param>
+    public static PithosDb OpenInMemory(PithosOptions? options = null)
+    {
+        if (options is not null && !options.InMemory)
+            throw new ArgumentException(
+                $"Options passed to {nameof(OpenInMemory)} must have {nameof(PithosOptions.InMemory)} = true.",
+                nameof(options));
+
+        return new PithosDb(":memory:", options ?? new PithosOptions { InMemory = true });
     }
 
     // ── Async API ──────────────────────────────────────────────────────────────
@@ -438,7 +465,7 @@ public sealed class PithosDb : IDisposable
     /// <summary>Flushes and closes the WAL, disposes all cached SSTable readers, then disposes the lock.</summary>
     public void Dispose()
     {
-        _wal.Dispose();
+        _wal?.Dispose();
         foreach (var reader in _readerCache.Values)
             reader.Dispose();
         _readerCache.Clear();

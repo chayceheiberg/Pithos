@@ -115,6 +115,14 @@ public sealed class PithosOptions
     /// </summary>
     public ICompactionFilter? CompactionFilter { get; init; } = null;
 
+    /// <summary>
+    /// When <see langword="true"/>, all data lives exclusively in memory. No WAL is written,
+    /// no SSTables are flushed to disk, and no state is recovered on open. Data is lost when
+    /// the instance is disposed. Useful for testing, caching, and ephemeral workloads.
+    /// Default: <see langword="false"/>.
+    /// </summary>
+    public bool InMemory { get; init; } = false;
+
     /// <summary>Default options — equivalent to <c>new PithosOptions()</c>.</summary>
     public static readonly PithosOptions Default = new();
 
