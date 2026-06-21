@@ -582,6 +582,44 @@ public sealed class PithosDb : IDisposable
         }
     }
 
+    // ── Snapshot ──────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Creates a point-in-time <see cref="Snapshot"/> of the database. The snapshot
+    /// reflects the exact state at the moment this method is called and remains
+    /// consistent regardless of subsequent writes or compactions. Dispose the snapshot
+    /// when finished to release its file handles.
+    /// <para>
+    /// The snapshot opens independent <see cref="Storage.SSTableReader"/> instances so
+    /// it does not share file handles with the live database. On Linux, open handles
+    /// keep file inodes alive after compaction removes them; on Windows, compaction
+    /// deletions silently fail and orphaned files are cleaned up on the next database
+    /// open.
+    /// </para>
+    /// </summary>
+    public Snapshot GetSnapshot()
+    {
+        _lock.EnterReadLock();
+        try
+        {
+            // Copy the MemTable into an independent sorted dictionary.
+            var mem = new SortedDictionary<byte[], byte[]?>(ByteArrayComparer.Instance);
+            foreach (var kv in _memTable.GetSortedEntries())
+                mem[kv.Key] = kv.Value;
+
+            // Capture the level structure and open dedicated readers for each SSTable.
+            // These readers are independent of the shared cache so the snapshot remains
+            // readable even after compaction recycles the shared cache entries.
+            var levelPaths = _levels.Select(l => l.ToList()).ToList();
+            var readers = new Dictionary<string, SSTableReader>(StringComparer.Ordinal);
+            foreach (var path in levelPaths.SelectMany(l => l))
+                readers[path] = new SSTableReader(path);
+
+            return new Snapshot(mem, levelPaths, readers, _options);
+        }
+        finally { _lock.ExitReadLock(); }
+    }
+
     // ── In-memory factory ─────────────────────────────────────────────────────
 
     /// <summary>
