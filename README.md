@@ -8,7 +8,7 @@
   <a href="https://github.com/chayceheiberg/PithosDB/actions/workflows/ci.yml"><img src="https://github.com/chayceheiberg/PithosDB/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <a href="https://codecov.io/gh/chayceheiberg/PithosDB"><img src="https://codecov.io/gh/chayceheiberg/PithosDB/branch/main/graph/badge.svg" alt="Coverage" /></a>
   <a href="https://www.nuget.org/packages/PithosDB"><img src="https://img.shields.io/nuget/v/PithosDB.svg" alt="NuGet" /></a>
-  <a href="https://www.nuget.org/packages/PithosDB"><img src="https://img.shields.io/nuget/dt/PithosDB.svg" alt="NuGet Downloads" /></a>
+  <a href="https://www.nuget.org/packages/PithosDB"><img src="https://img.shields.io/nuget/dt/PithosDB.svg?cacheSeconds=3600" alt="NuGet Downloads" /></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT" /></a>
 </p>
 
