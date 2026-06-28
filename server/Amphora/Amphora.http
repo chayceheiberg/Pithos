@@ -1,0 +1,34 @@
+@Amphora_HostAddress = http://localhost:5174
+
+### Put a key
+PUT {{Amphora_HostAddress}}/v1/keys/hello
+Content-Type: application/octet-stream
+
+world
+
+### Get a key
+GET {{Amphora_HostAddress}}/v1/keys/hello
+
+### Delete a key
+DELETE {{Amphora_HostAddress}}/v1/keys/hello
+
+### Scan all keys
+GET {{Amphora_HostAddress}}/v1/scan
+
+### Scan with prefix
+GET {{Amphora_HostAddress}}/v1/scan?prefix=user:
+
+### Scan with range
+GET {{Amphora_HostAddress}}/v1/scan?from=a&to=z
+
+### Batch write (values are base64-encoded)
+POST {{Amphora_HostAddress}}/v1/batch
+Content-Type: application/json
+
+[
+  {"op": "put", "key": "foo", "value": "YmFy"},
+  {"op": "delete", "key": "baz"}
+]
+
+### Stats
+GET {{Amphora_HostAddress}}/v1/stats
